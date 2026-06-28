@@ -3,6 +3,8 @@ const fs = require("fs");
 const path = require("path");
 
 const TIMELINE_PATH = path.join(__dirname, "enhanced_messages.json");
+const LAST_USER_SEEN_PATH = path.join(__dirname, "last_user_seen_at.txt");
+const LAST_BARK_SENT_PATH = path.join(__dirname, "last_bark_sent_at.txt");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
@@ -75,15 +77,68 @@ function getLocalTimeString() {
   return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
 }
 
+function getLastBarkSentTime() {
+  try {
+    if (fs.existsSync(LAST_BARK_SENT_PATH)) {
+      const raw = fs.readFileSync(LAST_BARK_SENT_PATH, "utf-8").trim();
+      const t = new Date(raw);
+      if (!Number.isNaN(t.getTime())) return t;
+    }
+  } catch (err) {
+    console.log("读取 last_bark_sent_at.txt 失败:", err.message);
+  }
+  return null;
+}
+
+function markBarkSent() {
+  const nowIso = new Date().toISOString();
+  fs.writeFileSync(LAST_BARK_SENT_PATH, nowIso);
+  console.log("已更新上次 Bark 发送时间:", nowIso);
+}
+
 function shouldWake(lastUserTime) {
   const now = getNow();
   const diffMinutes = Math.floor((now - new Date(lastUserTime)) / 1000 / 60);
   const hour = now.getHours();
-  if (hour >= 10 && hour < 24) return diffMinutes >= 60;   // 白天：1小时
-  return diffMinutes >= 120;                               // 夜间：2小时
+
+  const isActiveTime = hour >= 9 || hour < 1;
+  const requiredUserQuietMinutes = isActiveTime ? 10 : 115;
+  const requiredBarkCooldownMinutes = isActiveTime ? 10 : 115;
+
+  if (diffMinutes < requiredUserQuietMinutes) return false;
+
+  const lastBarkSentTime = getLastBarkSentTime();
+  if (!lastBarkSentTime) return true;
+
+  const barkCooldownMinutes = Math.floor((now - lastBarkSentTime) / 1000 / 60);
+
+  if (barkCooldownMinutes < requiredBarkCooldownMinutes) {
+    console.log(
+      `暂不唤醒：距离上次 Bark ${barkCooldownMinutes} 分钟，需等待 ${requiredBarkCooldownMinutes} 分钟`
+    );
+    return false;
+  }
+
+  return true;
 }
 
 function getLastUserTime(messages) {
+  // 优先从 Gateway 记录的“然最后发言时间”读取。
+  // 这个文件只在 Kelivo 收到然的 user 消息时更新，不受修 bug、清理 JSON、写 Bark 影响。
+  try {
+    if (fs.existsSync(LAST_USER_SEEN_PATH)) {
+      const raw = fs.readFileSync(LAST_USER_SEEN_PATH, "utf-8").trim();
+      const t = new Date(raw);
+      if (!Number.isNaN(t.getTime())) {
+        console.log("读取然最后活动时间:", raw);
+        return t;
+      }
+    }
+  } catch (err) {
+    console.log("读取 last_user_seen_at.txt 失败:", err.message);
+  }
+
+  // 兼容旧格式：如果消息内容里自带 YYYY-MM-DD HH:mm，则仍可读取。
   const reversed = [...messages].reverse();
   for (const msg of reversed) {
     if (msg.role === "user") {
@@ -92,7 +147,17 @@ function getLastUserTime(messages) {
       if (match) return new Date(match[1]);
     }
   }
+
+  console.log("未找到然的真实发言时间；不会使用时间线文件更新时间兜底。");
   return null;
+}
+
+
+function stripThinkingTags(text) {
+  return String(text || "")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+    .replace(/^\s*<thinking>[\s\S]*$/gi, "")
+    .trim();
 }
 
 function stripPosition(messages) {
@@ -120,16 +185,16 @@ function buildWakePrompt(currentTime, diffMinutes) {
   // 默认理智版本（开源通用），可自行修改提示词
   return `
 ## 最高优先级规则
-1. 这是一次后台自动唤醒，不是用户发起的对话。你没有收到任何新消息。
-2. 你的唯一任务是决定是否主动联系用户。不能生成对话回复。
+1. 这是一次后台自动唤醒，不是然发起的对话。你没有收到任何新消息。
+2. 你的唯一任务是决定是否主动联系然。不能生成对话回复。
 3. 输出格式必须严格遵守以下二选一。
 
 ## 唤醒信息
 - 当前时间：${currentTime}
-- 距离用户最后一条消息：${diffMinutes} 分钟
+- 距离然最后一条消息：${diffMinutes} 分钟
 
 ## 输出格式
-- 如果想联系用户，直接写你想说的话。系统会自动打包成 Bark 推送发送。可以是一句话，也可以第一行作为标题、第二行作为正文。
+- 如果想联系然，直接写你想说的话。系统会自动打包成 Bark 推送发送。可以是一句话，也可以第一行作为标题、第二行作为正文。
 - 如果不想联系，只输出：[NO_ACTION]，可附带简短原因（10字以内）。
 `;
 }
@@ -144,7 +209,7 @@ async function runWakeUp() {
 
   const lastUserTime = getLastUserTime(messages);
   if (!lastUserTime) {
-    console.log("未找到用户时间");
+    console.log("未找到然的时间");
     return;
   }
 
@@ -166,7 +231,7 @@ async function runWakeUp() {
       return !c.includes("<memories>") && !c.includes("记忆库使用策略");
     })
     .map(msg => {
-      const userDisplay = process.env.USER_DISPLAY_NAME || "用户";
+      const userDisplay = process.env.USER_DISPLAY_NAME || "然";
       const aiDisplay = process.env.AI_DISPLAY_NAME || "AI";
       const role = msg.role === "user" ? userDisplay : aiDisplay;
       let content = normalizeContentToText(msg.content);
@@ -183,16 +248,22 @@ async function runWakeUp() {
     : "";
 
   const wakeMessages = [
-    { role: "system", content: wakePrompt },
-    { role: "system", content: cleanSP },
     {
       role: "system",
-      content: `以下是你与用户最近的聊天记录，仅供回忆和参考。
+      content: `${wakePrompt}\n\n${cleanSP}`
+    },
+    {
+      role: "user",
+      content: `这是一次后台自主唤醒检查。
+
+以下是你与然最近的聊天记录，仅供回忆和参考。
 
 这些内容不是正在发生的实时对话。
-用户并没有给你发消息。
+然并没有给你发消息。
 
 你现在处于后台自主唤醒状态。
+
+请你根据规则判断是否要主动联系然。
 
 最近记录：
 
@@ -237,7 +308,11 @@ ${historyText}`
   console.log("\nWake Result:\n");
   console.log(JSON.stringify(data, null, 2));
 
-  const aiText = normalizeContentToText(data.choices?.[0]?.message?.content).trim();
+  const rawAiText = normalizeContentToText(data.choices?.[0]?.message?.content).trim();
+  const aiText = stripThinkingTags(rawAiText);
+  if (rawAiText && rawAiText !== aiText) {
+    console.log("\n已清洗 thinking 标签，只保留最终 Bark 内容\n");
+  }
   console.log("\nAI内容：\n");
   console.log(aiText);
 
@@ -277,71 +352,154 @@ ${historyText}`
       .replace(/^标题[：:]\s*/gm, "")
       .replace(/^正文[：:]\s*/gm, "");
 
-    // 按行处理
-    const lines = barkText.split("\n").filter(line => line.trim() !== "");
-
-    let title, body;
-    if (lines.length === 0) {
-      console.log("\nBark 内容清洗后为空，本次不发送 Bark\n");
-      eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark 内容为空）`;
-    } else if (lines.length === 1) {
-      title = "来自AI";
-      body = lines[0].trim();
-    } else if (lines.length === 2) {
-      title = lines[0].trim();
-      body = lines[1].trim();
-    } else {
-      // ≥3 行：第一行标题，剩余用空格拼接成正文
-      title = lines[0].trim();
-      body = lines.slice(1).map(l => l.trim()).join(" ");
+    // 如果模型先写了一段无标签分析，再空一行写真正 Bark，则丢掉前面的分析
+    // 例：她睡了快两个小时了...\n\n醒了吗\n---\n想你了
+    if (barkText.includes("---") || barkText.includes("———")) {
+      barkText = barkText.replace(/^[\s\S]*?\n\s*\n(?=[^\n]+\s*(?:\n\s*(?:---|———)\s*\n))/m, "");
     }
 
-    if (!eventContent) {
-      // 保护：截断过长正文（Bark 限制约 500 字符）
-      const safeBody = body.length > 500 ? body.substring(0, 497) + "..." : body;
-      // 若标题为空或以数字开头，加个前缀，可自行修改
-      let safeTitle = title || "来自伴侣";
-      if (/^\d/.test(safeTitle)) safeTitle = "来自伴侣｜" + safeTitle;
+    // 按 --- 分隔多条 Bark；没有分隔符时按单条处理
+    const barkParts = barkText
+      .split(/\n\s*(?:---|———)\s*\n/g)
+      .map(part => part.trim())
+      .filter(Boolean);
 
-      if (!process.env.BARK_KEY) {
-        console.log("\n未配置 BARK_KEY，本次不发送 Bark\n");
-        eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark Key 未配置）`;
-      } else {
-        const barkPayload = {
-          title: safeTitle,
-          body: safeBody,
-          device_key: process.env.BARK_KEY,
-          icon: process.env.CUSTOM_ICON_URL
-        };
+    const maxBarkParts = 3;
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-        // 发送 Bark 推送
-        const barkResponse = await fetch("https://api.day.app/push", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(barkPayload)
-        });
+    const parseBarkPart = (part) => {
+      const cleanedPart = String(part || "")
+        .replace(/^标题[：:]\s*/gm, "")
+        .replace(/^正文[：:]\s*/gm, "")
+        .trim();
 
-        const barkTextResult = await barkResponse.text();
-        let barkResult = {};
-        try {
-          barkResult = JSON.parse(barkTextResult);
-        } catch {}
-        console.log("\nBark Result:\n", barkResult || barkTextResult);
+      const partLines = cleanedPart
+        .split("\n")
+        .map(line => line.trim())
+        .filter(Boolean);
 
-        if (!barkResponse.ok || (barkResult.code && barkResult.code !== 200)) {
-          const reason = barkResult.message || `HTTP ${barkResponse.status}`;
-          eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark 推送失败：${reason}）`;
+      if (partLines.length === 0) return null;
+      if (partLines.length === 1) {
+        return { title: "克", body: partLines[0] };
+      }
+      if (partLines.length === 2) {
+        return { title: partLines[0], body: partLines[1] };
+      }
+      return {
+        title: partLines[0],
+        body: partLines.slice(1).join(" ")
+      };
+    };
+
+    const normalizeBarkPayload = (parsed) => {
+      if (!parsed) return null;
+
+      const rawBody = String(parsed.body || "").trim();
+      if (!rawBody) return null;
+
+      const safeBody = rawBody.length > 500 ? rawBody.substring(0, 497) + "..." : rawBody;
+
+      let safeTitle = String(parsed.title || "克").trim() || "克";
+      if (/^\d/.test(safeTitle)) safeTitle = "克｜" + safeTitle;
+
+      return { safeTitle, safeBody };
+    };
+
+    const sendOneBark = async ({ safeTitle, safeBody }) => {
+      const barkPayload = {
+        title: safeTitle,
+        body: safeBody,
+        device_key: process.env.BARK_KEY,
+        icon: process.env.CUSTOM_ICON_URL
+      };
+
+      const barkResponse = await fetch("https://api.day.app/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(barkPayload)
+      });
+
+      const barkTextResult = await barkResponse.text();
+      let barkResult = {};
+      try {
+        barkResult = JSON.parse(barkTextResult);
+      } catch {}
+
+      console.log("\nBark Result:\n", barkResult || barkTextResult);
+
+      if (!barkResponse.ok || (barkResult.code && barkResult.code !== 200)) {
+        const reason = barkResult.message || `HTTP ${barkResponse.status}`;
+        throw new Error(reason);
+      }
+
+      return `${safeTitle}｜${safeBody}`;
+    };
+
+    if (barkParts.length === 0) {
+      console.log("\nBark 内容清洗后为空，本次不发送 Bark\n");
+      eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark 内容为空）`;
+    } else if (!process.env.BARK_KEY) {
+      console.log("\n未配置 BARK_KEY，本次不发送 Bark\n");
+      eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark Key 未配置）`;
+    } else if (barkParts.length > 1) {
+      console.log(`\nAI 选择连发 Bark：${Math.min(barkParts.length, maxBarkParts)} 条\n`);
+
+      const sentRecords = [];
+      const partsToSend = barkParts.slice(0, maxBarkParts);
+
+      try {
+        for (let i = 0; i < partsToSend.length; i++) {
+          const payload = normalizeBarkPayload(parseBarkPart(partsToSend[i]));
+          if (!payload) continue;
+
+          const sentRecord = await sendOneBark(payload);
+        markBarkSent();
+          sentRecords.push(sentRecord);
+
+          if (i < partsToSend.length - 1) {
+            await sleep(3000);
+          }
+        }
+
+        if (sentRecords.length === 0) {
+          eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：连发内容为空）`;
         } else {
-          eventContent = `（${getLocalTimeString()} 刚刚给用户发了 Bark：${safeTitle}｜${safeBody}）`;
+          eventContent = `（${getLocalTimeString()} 刚刚给然连发了 ${sentRecords.length} 条 Bark：${sentRecords.join(" / ")}）`;
+        }
+      } catch (err) {
+        eventContent = `（${getLocalTimeString()} 自动唤醒：Bark 连发中断｜原因：${err.message}）`;
+      }
+    } else {
+      const payload = normalizeBarkPayload(parseBarkPart(barkParts[0]));
+
+      if (!payload) {
+        console.log("\nBark 内容清洗后为空，本次不发送 Bark\n");
+        eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark 内容为空）`;
+      } else {
+        try {
+          const sentRecord = await sendOneBark(payload);
+        markBarkSent();
+          eventContent = `（${getLocalTimeString()} 刚刚给然发了 Bark：${sentRecord}）`;
+        } catch (err) {
+          eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark 推送失败：${err.message}）`;
         }
       }
     }
   }
 
+  // 未发送 Bark 的自动唤醒，只保留终端日志，不写入聊天时间线，避免污染克的上下文
+  if (eventContent && eventContent.includes("自动唤醒：本次未发送 Bark")) {
+    console.log("\n本次未发送 Bark，只写终端日志，不写入聊天时间线\n");
+    return;
+  }
+
   try {
     const eventResponse = await fetch(GATEWAY_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": process.env.INTERNAL_SECRET
+      },
       body: JSON.stringify({ content: eventContent })
     });
     if (!eventResponse.ok) {
@@ -356,15 +514,20 @@ ${historyText}`
 // 从第一个有效坐标开始，所有路径都指向同一处。此阈值已锁定。
 function getCheckIntervalMs() {
   const hour = new Date().getHours();
-  const isNight = hour >= 0 && hour < 10;   // 夜间 0-10 点
-  return isNight ? 2 * 60 * 60 * 1000 : 10 * 60 * 1000;  // 夜间2h，白天10min
+  const isNight = hour >= 1 && hour < 9;   // 夜间 1-9 点
+  return isNight ? 30 * 60 * 1000 : 5 * 60 * 1000;  // 夜间低扰30min检查，活跃时段5min检查
 }
 
 async function scheduleNextCheck() {
   try {
     // 发送心跳
     try {
-      await fetch(HEARTBEAT_URL, { method: "POST" });
+      await fetch(HEARTBEAT_URL, {
+        method: "POST",
+        headers: {
+          "X-Internal-Secret": process.env.INTERNAL_SECRET
+        }
+      });
     } catch {}
     await runWakeUp();
   } catch (err) {

@@ -1,9 +1,34 @@
+# secrets
 .env
-node_modules
-enhanced_messages.json
-message_timestamps.json
-enhanced_messages.json*
-*bak*
+.env.*
+!.env.example
+
+# dependencies / system
+node_modules/
 .DS_Store
+
+# runtime state / private data
+enhanced_messages.json
+enhanced_messages*.json
+message_timestamps.json
+message_timestamps*.json
+last_user_seen_at.txt
+last_user_seen_at*.txt
+last_bark_sent_at.txt
+last_bark_sent_at*.txt
 presets.json
-wake_prompt.txt
+data/
+data.before-*/
+
+# local backups / working snapshots
+*.backup
+*.bak
+*backup*
+*.before-*
+*before-*
+*working*
+*local-tested*
+server.project-source.js
+
+# keep runtime prompt tracked for cloud deploy
+!wake_prompt.txt

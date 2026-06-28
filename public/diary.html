@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dylan 双人日记本</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Noto Serif SC", "PingFang SC", serif;
+      background:
+        radial-gradient(circle at top left, rgba(255, 210, 220, 0.45), transparent 34%),
+        linear-gradient(135deg, #fff7f9 0%, #f6e7ec 100%);
+      color: #5b3f47;
+      padding: 32px 18px;
+    }
+
+    .book {
+      max-width: 1100px;
+      margin: 0 auto;
+      background: rgba(255, 255, 255, 0.78);
+      border: 1px solid rgba(210, 160, 175, 0.28);
+      border-radius: 28px;
+      box-shadow: 0 18px 55px rgba(160, 90, 110, 0.16);
+      padding: 28px;
+      backdrop-filter: blur(14px);
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 30px;
+      letter-spacing: 4px;
+      color: #8a4a58;
+    }
+
+    .subtitle {
+      margin-top: 8px;
+      font-size: 13px;
+      color: #9b7580;
+      letter-spacing: 2px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-bottom: 22px;
+    }
+
+    .date-nav {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .date-display {
+      min-width: 160px;
+      text-align: center;
+      border: 1px solid rgba(190, 135, 150, 0.28);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.74);
+      color: #5b3f47;
+      padding: 12px 18px;
+      font-size: 20px;
+      letter-spacing: 1px;
+      font-weight: 600;
+    }
+
+    .date-hidden {
+      display: none;
+    }
+
+    input[type="date"], input[type="text"], textarea {
+      border: 1px solid rgba(190, 135, 150, 0.28);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.74);
+      color: #533b42;
+      font: inherit;
+      padding: 10px 12px;
+      outline: none;
+    }
+
+    input[type="date"]:focus, input[type="text"]:focus, textarea:focus {
+      border-color: #c98fa0;
+      box-shadow: 0 0 0 3px rgba(201, 143, 160, 0.12);
+    }
+
+    .pages {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+
+    .page {
+      background: rgba(255, 252, 253, 0.78);
+      border: 1px solid rgba(220, 180, 190, 0.38);
+      border-radius: 22px;
+      padding: 18px;
+      min-height: 430px;
+    }
+
+    .page h2 {
+      margin: 0 0 12px;
+      color: #8a4a58;
+      font-size: 20px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 230px;
+      resize: vertical;
+      line-height: 1.8;
+      font-size: 15px;
+    }
+
+    .cover-note {
+      width: 100%;
+      margin-top: 10px;
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 12px 0;
+      color: #7b5d66;
+      font-size: 14px;
+    }
+
+    .locked-view {
+      border: 1px dashed rgba(170, 120, 135, 0.42);
+      background: rgba(255, 245, 248, 0.72);
+      border-radius: 18px;
+      padding: 18px;
+      min-height: 230px;
+      line-height: 1.8;
+      color: #7f5965;
+      display: none;
+      white-space: pre-wrap;
+    }
+
+    .history-box {
+      margin: 0 0 22px;
+      background: rgba(255, 250, 252, 0.72);
+      border: 1px solid rgba(220, 180, 190, 0.38);
+      border-radius: 20px;
+      padding: 16px;
+    }
+
+    .history-box h3 {
+      margin: 0 0 10px;
+      color: #8a4a58;
+      font-size: 16px;
+      letter-spacing: 1px;
+    }
+
+    .history-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-height: 34px;
+      align-items: center;
+    }
+
+    .history-date {
+      border: 1px solid rgba(190, 135, 150, 0.28);
+      background: rgba(255, 255, 255, 0.72);
+      color: #835866;
+      border-radius: 999px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      box-shadow: none;
+    }
+
+    .history-empty {
+      color: #9b7580;
+      font-size: 13px;
+      font-style: italic;
+    }
+
+    .anchor-box {
+      margin-top: 18px;
+      background: rgba(255, 250, 252, 0.72);
+      border: 1px solid rgba(220, 180, 190, 0.38);
+      border-radius: 20px;
+      padding: 16px;
+    }
+
+    .anchor-box label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 14px;
+      color: #7b5d66;
+    }
+
+    .anchor-box input {
+      width: 100%;
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 18px;
+    }
+
+    button {
+      border: none;
+      border-radius: 14px;
+      padding: 12px 16px;
+      font: inherit;
+      cursor: pointer;
+      background: linear-gradient(135deg, #d59aaa, #c48698);
+      color: white;
+      box-shadow: 0 8px 20px rgba(170, 100, 120, 0.18);
+    }
+
+    button.secondary {
+      background: rgba(255, 255, 255, 0.7);
+      color: #835866;
+      border: 1px solid rgba(190, 135, 150, 0.28);
+      box-shadow: none;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin-top: 14px;
+      color: #9b7580;
+      font-size: 13px;
+      min-height: 20px;
+    }
+
+    @media (max-width: 800px) {
+      .pages { grid-template-columns: 1fr; }
+      .book { padding: 20px; }
+    }
+  
+    .home-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: fit-content;
+      margin-top: 14px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      text-decoration: none;
+      background: rgba(242, 220, 227, 0.82);
+      color: #8a4a58;
+      font-size: 14px;
+      letter-spacing: 0.04em;
+      border: 1px solid rgba(214, 170, 184, 0.28);
+    }
+
+    .home-pill:hover {
+      background: rgba(235, 202, 213, 0.95);
+    }
+
+    .page-lock-row {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .page-lock-row input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      min-width: 18px;
+      flex: 0 0 auto;
+      margin: 0;
+    }
+
+    .page-lock-row label {
+      margin: 0;
+      color: #7d5661;
+      font-size: 15px;
+      line-height: 1.4;
+    }
+
+    .page-lock-notice {
+      display: none;
+      margin-top: 10px;
+      color: #8a4a58;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .page-lock-notice.show {
+      display: block;
+    }
+
+  
+    /* v0.1.6a home pill top-left */
+    header {
+      position: relative;
+    }
+
+    .home-pill {
+      position: absolute;
+      left: 24px;
+      top: 24px;
+      margin-top: 0;
+    }
+
+    @media (max-width: 700px) {
+      .home-pill {
+        position: static;
+        margin: 14px auto 0;
+      }
+    }
+
+  
+    /* v0.1.6b restore home pill to centered ritual position */
+    header {
+      position: static;
+    }
+
+    .home-pill {
+      position: static;
+      margin: 14px auto 0;
+    }
+
+  </style>
+</head>
+<body>
+  <main class="book">
+    <header>
+      <h1>双人日记本</h1>
+      <div class="subtitle">不是日志，是写给未来的关系锚点</div>
+      <a class="home-pill" href="/dashboard">← 回小屋</a>
+    </header>
+
+    <section class="toolbar">
+      <label>日期</label>
+      <div class="date-nav">
+        <button class="secondary" onclick="shiftDate(-1)">← 前一天</button>
+        <div id="dateDisplay" class="date-display">----</div>
+        <button class="secondary" onclick="shiftDate(1)">后一天 →</button>
+        <button class="secondary" onclick="goToday()">今天</button>
+      </div>
+      <input id="dateInput" class="date-hidden" type="date" />
+    </section>
+
+    <section class="history-box">
+      <h3>最近的日记</h3>
+      <div id="historyList" class="history-list">
+        <span class="history-empty">还在翻找本子……</span>
+      </div>
+    </section>
+
+    <section class="pages">
+      <article class="page">
+        <h2>然然的这一页</h2>
+        <div id="ranranLockedView" class="locked-view"></div>
+        <textarea id="ranranEntry" placeholder="然然今天想写些什么……"></textarea>
+        <div class="row">
+          <input id="ranranLocked" type="checkbox" onchange="renderLocks()" />
+          <label for="ranranLocked">锁上我的这一页</label>
+        </div>
+        <input id="ranranCoverNote" class="cover-note" type="text" placeholder="封面句，例如：这页我先留给自己。" />
+      </article>
+
+      <article class="page">
+        <h2>克的这一页</h2>
+        <div id="keLockedView" class="locked-view"></div>
+        <textarea id="keEntry" placeholder="可以先从 Kelivo 里复制克写好的日记到这里。"></textarea>
+        <div class="row">
+          <input id="keLocked" type="checkbox" onchange="renderLocks()" />
+          <label for="keLocked">锁上克的这一页</label>
+        </div>
+        <input id="keCoverNote" class="cover-note" type="text" placeholder="封面句，例如：他把这页合上了。" />
+      </article>
+    </section>
+
+    <section class="anchor-box">
+      <label for="anchor">这一页的关系锚点</label>
+      <input id="anchor" type="text" placeholder="例如：今天水管很差，但我们还是开始给克做日记本。" />
+
+      <div class="page-lock-row">
+        <input id="pageLocked" type="checkbox" onchange="renderPageLock()" />
+        <label for="pageLocked">封存本页</label>
+      </div>
+      <div id="pageLockNotice" class="page-lock-notice">这一页已封存。仍可编辑。</div>
+    </section>
+
+    <section class="actions">
+      <button onclick="saveDiary()">保存今天这一页</button>
+      <button disabled>邀请克写日记 · 当前水管不可用，先手动粘贴</button>
+    </section>
+
+    <div id="status" class="status"></div>
+  </main>
+
+  <script>
+    function todayString() {
+      const now = new Date();
+      const offset = now.getTimezoneOffset();
+      const local = new Date(now.getTime() - offset * 60000);
+      return local.toISOString().slice(0, 10);
+    }
+
+    function setStatus(text) {
+      document.getElementById("status").textContent = text;
+    }
+
+    function formatDateForDisplay(date) {
+      return String(date || "").replace(/-/g, "/");
+    }
+
+    function updateDateDisplay() {
+      const date = document.getElementById("dateInput").value || todayString();
+      document.getElementById("dateDisplay").textContent = formatDateForDisplay(date);
+    }
+
+    function formatLocalDate(d) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    }
+
+    function shiftDate(days) {
+      const input = document.getElementById("dateInput");
+      const current = input.value || todayString();
+      const parts = current.split("-").map(Number);
+      const d = new Date(parts[0], parts[1] - 1, parts[2]);
+      d.setDate(d.getDate() + days);
+      input.value = formatLocalDate(d);
+      updateDateDisplay();
+      loadDiary();
+    }
+
+    function goToday() {
+      document.getElementById("dateInput").value = todayString();
+    updateDateDisplay();
+      updateDateDisplay();
+      loadDiary();
+    }
+
+    function getPageFromForm() {
+      return {
+        date: document.getElementById("dateInput").value,
+        ranran_entry: document.getElementById("ranranEntry").value,
+        ke_entry: document.getElementById("keEntry").value,
+        ranran_locked: document.getElementById("ranranLocked").checked,
+        ke_locked: document.getElementById("keLocked").checked,
+        ranran_cover_note: document.getElementById("ranranCoverNote").value,
+        ke_cover_note: document.getElementById("keCoverNote").value,
+        page_locked: document.getElementById("pageLocked").checked,
+        anchor: document.getElementById("anchor").value
+      };
+    }
+
+    function fillForm(page) {
+      document.getElementById("dateInput").value = page.date || todayString();
+      updateDateDisplay();
+      document.getElementById("ranranEntry").value = page.ranran_entry || "";
+      document.getElementById("keEntry").value = page.ke_entry || "";
+      document.getElementById("ranranLocked").checked = !!page.ranran_locked;
+      document.getElementById("keLocked").checked = !!page.ke_locked;
+      document.getElementById("ranranCoverNote").value = page.ranran_cover_note || "";
+      document.getElementById("keCoverNote").value = page.ke_cover_note || "";
+      document.getElementById("pageLocked").checked = !!page.page_locked;
+      document.getElementById("anchor").value = page.anchor || "";
+      renderLocks();
+    }
+
+    function renderPageLock() {
+      const checked = document.getElementById("pageLocked").checked;
+      const notice = document.getElementById("pageLockNotice");
+      if (notice) notice.classList.toggle("show", checked);
+    }
+
+    function renderLocks() {
+      const ranranLocked = document.getElementById("ranranLocked").checked;
+      const keLocked = document.getElementById("keLocked").checked;
+
+      const ranranView = document.getElementById("ranranLockedView");
+      const keView = document.getElementById("keLockedView");
+
+      const ranranText = document.getElementById("ranranEntry");
+      const keText = document.getElementById("keEntry");
+
+      ranranView.textContent = document.getElementById("ranranCoverNote").value || "然然把这页合上了。";
+      keView.textContent = document.getElementById("keCoverNote").value || "他把这页合上了。";
+
+      ranranView.style.display = ranranLocked ? "block" : "none";
+      keView.style.display = keLocked ? "block" : "none";
+
+      ranranText.style.display = ranranLocked ? "none" : "block";
+      keText.style.display = keLocked ? "none" : "block";
+    }
+
+    async function loadDiary() {
+      const date = document.getElementById("dateInput").value || todayString();
+      setStatus("读取中……");
+      const resp = await fetch("/api/diary?date=" + encodeURIComponent(date));
+      const page = await resp.json();
+      fillForm(page);
+      setStatus("已读取 " + date);
+    }
+
+    async function loadHistoryList() {
+      const box = document.getElementById("historyList");
+      if (!box) return;
+
+      try {
+        const resp = await fetch("/api/diary/list");
+        const data = await resp.json();
+        const dates = data.dates || [];
+
+        if (!dates.length) {
+          box.innerHTML = '<span class="history-empty">还没有保存过的日记。</span>';
+          return;
+        }
+
+        box.innerHTML = dates.map(date => {
+          return '<button class="history-date" type="button" onclick="openHistoryDate(\'' + date + '\')">' + date + '</button>';
+        }).join("");
+      } catch (err) {
+        box.innerHTML = '<span class="history-empty">历史列表读取失败。</span>';
+      }
+    }
+
+    function openHistoryDate(date) {
+      document.getElementById("dateInput").value = date;
+      loadDiary();
+    loadHistoryList();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    async function saveDiary() {
+      const page = getPageFromForm();
+      if (!page.date) {
+        alert("请先选择日期");
+        return;
+      }
+
+      setStatus("保存中……");
+      const resp = await fetch("/api/diary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(page)
+      });
+
+      const result = await resp.json();
+      if (result.success) {
+        fillForm(result.page);
+        await loadHistoryList();
+        setStatus("已保存 " + result.page.updated_at);
+      } else {
+        setStatus("保存失败：" + (result.error || "未知错误"));
+      }
+    }
+
+    document.getElementById("dateInput").value = todayString();
+    updateDateDisplay();
+    document.getElementById("ranranCoverNote").addEventListener("input", renderLocks);
+    document.getElementById("keCoverNote").addEventListener("input", renderLocks);
+    loadDiary();
+    loadHistoryList();
+  </script>
+</body>
+</html>

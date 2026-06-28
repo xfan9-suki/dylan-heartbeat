@@ -22,6 +22,19 @@ const PORT = Number(process.env.PORT) || 3000;
 const TARGET_API_URL = process.env.TARGET_API_URL;
 const TIMELINE_FILE = "enhanced_messages.json";
 const TIMESTAMP_DB_FILE = "./message_timestamps.json";
+const LAST_USER_SEEN_FILE = "./last_user_seen_at.txt";
+
+function markLastUserSeen(messages) {
+  if (!Array.isArray(messages)) return;
+
+  const hasUserMessage = messages.some(msg => msg && msg.role === "user");
+  if (!hasUserMessage) return;
+
+  fs.writeFileSync(LAST_USER_SEEN_FILE, new Date().toISOString());
+  console.log("\n已更新然最后活动时间:", new Date().toISOString(), "\n");
+}
+
+
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up";
 
 // ========================
@@ -335,6 +348,65 @@ function appendSpecialEvent(content) {
   console.log(`\n已记录特殊事件 (position ${newEvent.position}): ${content}\n`);
 }
 
+
+function appendAssistantReply(content) {
+  const text = normalizeContentToText(content).trim();
+  if (!text) return;
+
+  const timeline = loadTimeline();
+
+  const lastReal = [...timeline].reverse().find(msg => msg.role === "user" || msg.role === "assistant");
+  if (lastReal && lastReal.role === "assistant" && normalizeContentToText(lastReal.content).trim() === text) {
+    console.log("\n普通 assistant 回复已存在，跳过落盘\n");
+    return;
+  }
+
+  let maxPos = 0;
+  for (const msg of timeline) {
+    if (typeof msg.position === "number" && msg.position > maxPos) maxPos = msg.position;
+  }
+
+  const newMsg = { role: "assistant", content: text, position: maxPos + 0.5 };
+  timeline.push(newMsg);
+  saveTimeline(timeline);
+
+  console.log(`\n已记录普通 assistant 回复 (position ${newMsg.position}): ${text.slice(0, 80)}\n`);
+}
+
+function extractAssistantTextFromUpstreamBody(bufferText) {
+  const raw = (bufferText || "").trim();
+  if (!raw) return "";
+
+  // 非流式 JSON 兜底
+  try {
+    const data = JSON.parse(raw);
+    const content = data.choices?.[0]?.message?.content;
+    const text = normalizeContentToText(content).trim();
+    if (text) return text;
+  } catch {}
+
+  // OpenAI SSE 流式格式：data: {...}
+  let text = "";
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("data:")) continue;
+
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+
+    try {
+      const data = JSON.parse(payload);
+      const deltaContent = data.choices?.[0]?.delta?.content;
+      const messageContent = data.choices?.[0]?.message?.content;
+
+      if (deltaContent) text += normalizeContentToText(deltaContent);
+      if (messageContent) text += normalizeContentToText(messageContent);
+    } catch {}
+  }
+
+  return text.trim();
+}
+
 function stripPosition(messages) {
   return messages.map(({ position, ...rest }) => rest);
 }
@@ -415,14 +487,97 @@ function readRestartCommand() {
 }
 
 // ========================
-// 安全：放行 /admin，其他仅本地/局域网
+// 安全：Dylan Cloud v0.1.8 路径级鉴权 helper
+// ========================
+function getBearerToken(req) {
+  const auth = req.headers.authorization || "";
+  const [scheme, token] = auth.split(" ");
+  if (scheme !== "Bearer" || !token) return "";
+  return token.trim();
+}
+
+function requireGatewayBearer(req, reply, done) {
+  const expected = process.env.GATEWAY_API_KEY;
+  const provided = getBearerToken(req);
+
+  if (!expected) {
+    reply.code(500).send({ error: "GATEWAY_API_KEY not configured" });
+    return;
+  }
+
+  if (provided !== expected) {
+    reply.code(401).send({ error: "Unauthorized" });
+    return;
+  }
+
+  done();
+}
+
+function requireInternalSecret(req, reply, done) {
+  const expected = process.env.INTERNAL_SECRET;
+  const provided = req.headers["x-internal-secret"];
+
+  if (!expected) {
+    reply.code(500).send({ error: "INTERNAL_SECRET not configured" });
+    return;
+  }
+
+  if (provided !== expected) {
+    reply.code(401).send({ error: "Unauthorized" });
+    return;
+  }
+
+  done();
+}
+
+function requireDiaryWriteAuth(req, reply, done) {
+  const expectedToken = process.env.DIARY_ADMIN_TOKEN;
+  const providedToken = req.headers["x-dylan-token"] || getBearerToken(req);
+
+  if (expectedToken && providedToken === expectedToken) {
+    done();
+    return;
+  }
+
+  return basicAuth(req, reply, done);
+}
+
+function isDiaryReadPath(path) {
+  return path === "/api/diary" ||
+    path === "/api/diary/list" ||
+    path === "/api/dashboard/diary-status";
+}
+
+// ========================
+// 安全：Dylan Cloud v0.1.8 路径级鉴权
 // ========================
 app.addHook("onRequest", (req, reply, done) => {
-  if (req.url.startsWith("/admin")) return done();
-  const ip = req.ip || req.connection.remoteAddress;
-  if (ip === "127.0.0.1" || ip === "::1" || ip === "localhost") return done();
-  if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip)) return done();
-  reply.code(403).send("Forbidden");
+  const path = (req.url || "").split("?")[0];
+  const method = (req.method || "").toUpperCase();
+
+  if (path === "/v1/models" || path === "/v1/chat/completions") {
+    return requireGatewayBearer(req, reply, done);
+  }
+
+  if (path.startsWith("/internal/")) {
+    return requireInternalSecret(req, reply, done);
+  }
+
+  if (path === "/api/diary" && method === "POST") {
+    return requireDiaryWriteAuth(req, reply, done);
+  }
+
+  if (
+    path === "/" ||
+    path === "/dashboard" ||
+    path === "/diary" ||
+    path === "/test-bark" ||
+    isDiaryReadPath(path)
+  ) {
+    return basicAuth(req, reply, done);
+  }
+
+  done();
 });
 
 // ========================
@@ -447,6 +602,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     console.log("============================\n");
 
     const kelivoMessages = body.messages || [];
+    markLastUserSeen(kelivoMessages);
     const oldTimeline = loadTimeline();
 
     const tsDB = loadTimestampDB();
@@ -575,15 +731,41 @@ app.post("/v1/chat/completions", async (req, reply) => {
       return reply.code(500).send({ error: "TARGET_API_URL / TARGET_API_KEY 未配置" });
     }
 
-    // 请求模型
-    const response = await fetch(TARGET_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.TARGET_API_KEY}`
-      },
-      body: JSON.stringify({ ...body, messages: llmMessages })
-    });
+    // 请求模型：带自动重试，减少偶发 fetch failed / ConnectTimeoutError
+    let response;
+    const requestPayload = JSON.stringify({ ...body, messages: llmMessages });
+    const maxRetries = 3;
+
+    const retryableStatuses = new Set([429, 500, 502, 503, 504]);
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        console.log(`🔁 上游请求尝试 ${attempt}/${maxRetries}`);
+        response = await fetch(TARGET_API_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+          },
+          body: requestPayload
+        });
+    
+        if (retryableStatuses.has(response.status) && attempt < maxRetries) {
+          console.error(`⚠️ 上游返回 HTTP ${response.status}，准备重试 ${attempt}/${maxRetries}`);
+          try {
+            if (response.body) await response.body.cancel();
+          } catch {}
+          await new Promise(resolve => setTimeout(resolve, attempt * 1500));
+          continue;
+        }
+    
+        break;
+      } catch (err) {
+        console.error(`⚠️ 上游请求失败 ${attempt}/${maxRetries}:`, err.message);
+        if (attempt === maxRetries) throw err;
+        await new Promise(resolve => setTimeout(resolve, attempt * 1500));
+      }
+    }
 
     if (!response.body) {
       return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
@@ -596,12 +778,27 @@ app.post("/v1/chat/completions", async (req, reply) => {
     });
 
     const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let upstreamTextBuffer = "";
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      upstreamTextBuffer += decoder.decode(value, { stream: true });
       reply.raw.write(value);
     }
+    upstreamTextBuffer += decoder.decode();
     reply.raw.end();
+
+    const assistantTextToSave = extractAssistantTextFromUpstreamBody(upstreamTextBuffer);
+    if (!assistantTextToSave) {
+      console.log("");
+      console.log("未提取到普通 assistant 文本，上游片段:");
+      console.log(upstreamTextBuffer.slice(0, 800));
+    }
+    if (assistantTextToSave) {
+      appendAssistantReply(assistantTextToSave);
+    }
   } catch (err) {
     console.error(err);
     reply.code(500).send({ error: err.message });
@@ -1191,6 +1388,33 @@ const html = `<!DOCTYPE html>
 
     renderPresets();
   </script>
+  <script>
+    async function loadDiaryStatus() {
+      const box = document.getElementById("diaryStatusLine");
+      if (!box) return;
+
+      try {
+        const resp = await fetch("/api/dashboard/diary-status");
+        const data = await resp.json();
+
+        const ranran = data.ranran_written ? "已写" : "未写";
+        const ke = data.ke_written ? "已写" : "未写";
+        const pageLocked = data.page_locked ? "已封存" : "未封存";
+        const latest = data.latest_date || "还没有";
+        const total = data.total_pages || 0;
+
+        box.innerHTML =
+          "<strong>然然：</strong>" + ranran + " · <strong>克：</strong>" + ke +
+          "<br><strong>本页：</strong>" + pageLocked +
+          "<br><strong>最近一篇：</strong>" + latest +
+          "<br><strong>累计页数：</strong>" + total;
+      } catch (err) {
+        box.textContent = "日记状态读取失败。";
+      }
+    }
+
+    loadDiaryStatus();
+  </script>
 </body>
 </html>`;
 
@@ -1304,6 +1528,716 @@ app.get("/test-bark", async (req, reply) => {
   appendSpecialEvent(`（${formattedTime} 刚刚给宝宝发了Bark：怎么还不睡。）`);
   reply.send({ success: true });
 });
+
+
+// ========================
+// Dylan 双人日记本 v0.1
+// 本地双人日记：不调用上游，不碰 wake_up，不碰 Gateway 主聊天逻辑
+// ========================
+const DIARY_DIR = "./data/diary";
+const DIARY_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function ensureDiaryDir() {
+  fs.ensureDirSync(DIARY_DIR);
+}
+
+function getLocalDateString() {
+  const now = new Date();
+  const offset = now.getTimezoneOffset();
+  const local = new Date(now.getTime() - offset * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+function normalizeDiaryDate(date) {
+  const value = String(date || "").trim() || getLocalDateString();
+  if (!DIARY_DATE_RE.test(value)) {
+    const err = new Error("invalid diary date");
+    err.statusCode = 400;
+    throw err;
+  }
+  return value;
+}
+
+function getDiaryPath(date) {
+  const safeDate = normalizeDiaryDate(date);
+  return `${DIARY_DIR}/${safeDate}.json`;
+}
+
+function createEmptyDiaryPage(date) {
+  const now = new Date().toISOString();
+  return {
+    date,
+    ranran_entry: "",
+    ke_entry: "",
+    ranran_locked: false,
+    ke_locked: false,
+    ranran_cover_note: "",
+    ke_cover_note: "",
+    page_locked: false,
+    anchor: "",
+    created_at: now,
+    updated_at: now
+  };
+}
+
+function readDiaryPage(dateInput) {
+  ensureDiaryDir();
+  const date = normalizeDiaryDate(dateInput);
+  const file = getDiaryPath(date);
+
+  if (!fs.existsSync(file)) {
+    return createEmptyDiaryPage(date);
+  }
+
+  try {
+    return { ...createEmptyDiaryPage(date), ...fs.readJsonSync(file), date };
+  } catch {
+    return createEmptyDiaryPage(date);
+  }
+}
+
+function writeDiaryPage(input) {
+  ensureDiaryDir();
+
+  const date = normalizeDiaryDate(input && input.date);
+  const oldPage = readDiaryPage(date);
+  const now = new Date().toISOString();
+
+  const page = {
+    date,
+    ranran_entry: String(input.ranran_entry || ""),
+    ke_entry: String(input.ke_entry || ""),
+    ranran_locked: !!input.ranran_locked,
+    ke_locked: !!input.ke_locked,
+    ranran_cover_note: String(input.ranran_cover_note || ""),
+    ke_cover_note: String(input.ke_cover_note || ""),
+    page_locked: !!input.page_locked,
+    anchor: String(input.anchor || ""),
+    created_at: oldPage.created_at || now,
+    updated_at: now
+  };
+
+  fs.writeJsonSync(getDiaryPath(date), page, { spaces: 2 });
+  return page;
+}
+
+
+// ========================
+// Mobile Entry：首页入口
+// ========================
+app.get("/", async (req, reply) => {
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>克的小屋 · Mobile Entry</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Serif SC", "Noto Sans SC", sans-serif;
+      background:
+        radial-gradient(circle at 18% 18%, rgba(255, 221, 231, 0.72), transparent 34%),
+        radial-gradient(circle at 82% 6%, rgba(230, 213, 255, 0.48), transparent 28%),
+        linear-gradient(135deg, #fff7fa 0%, #f7edf2 56%, #f4e8ee 100%);
+      color: #5b4048;
+      padding: max(22px, env(safe-area-inset-top)) 18px max(22px, env(safe-area-inset-bottom));
+    }
+
+    .phone {
+      width: min(100%, 520px);
+      margin: 0 auto;
+      min-height: calc(100vh - 44px);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 18px;
+    }
+
+    .hero {
+      padding: 30px 24px;
+      border-radius: 30px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid rgba(210, 160, 176, 0.22);
+      box-shadow: 0 18px 50px rgba(160, 100, 120, 0.13);
+      backdrop-filter: blur(18px);
+    }
+
+    .topline {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .avatar {
+      width: 48px;
+      height: 48px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #8a4a58, #d8a0ad);
+      box-shadow: 0 10px 24px rgba(160, 100, 120, 0.18);
+      position: relative;
+      flex: 0 0 auto;
+    }
+
+    .avatar::after {
+      content: "";
+      position: absolute;
+      right: -2px;
+      top: -2px;
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      background: #55d37a;
+      border: 3px solid #fff7fa;
+    }
+
+    .name strong {
+      display: block;
+      font-size: 22px;
+      color: #8a4a58;
+      letter-spacing: 0.04em;
+    }
+
+    .name span {
+      display: block;
+      margin-top: 4px;
+      font-size: 12px;
+      color: #a87886;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(34px, 11vw, 56px);
+      line-height: 1.04;
+      color: #8a4a58;
+      letter-spacing: 0.03em;
+    }
+
+    .subtitle {
+      margin: 16px 0 0;
+      font-size: 15px;
+      line-height: 1.8;
+      color: #7a5d65;
+    }
+
+    .actions {
+      display: grid;
+      gap: 12px;
+    }
+
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px 18px;
+      border-radius: 24px;
+      text-decoration: none;
+      color: inherit;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid rgba(210, 160, 176, 0.2);
+      box-shadow: 0 12px 32px rgba(160, 100, 120, 0.10);
+      backdrop-filter: blur(14px);
+    }
+
+    .btn:active {
+      transform: scale(0.99);
+    }
+
+    .left {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      min-width: 0;
+    }
+
+    .icon {
+      width: 42px;
+      height: 42px;
+      border-radius: 17px;
+      display: grid;
+      place-items: center;
+      background: rgba(242, 220, 227, 0.78);
+      font-size: 22px;
+      flex: 0 0 auto;
+    }
+
+    .label strong {
+      display: block;
+      font-size: 17px;
+      color: #774652;
+      margin-bottom: 4px;
+    }
+
+    .label span {
+      display: block;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #8f7880;
+    }
+
+    .arrow {
+      color: #ad7d8b;
+      font-size: 22px;
+      flex: 0 0 auto;
+    }
+
+    .note {
+      text-align: center;
+      color: #a1868f;
+      font-size: 12px;
+      line-height: 1.7;
+      margin: 4px 10px 0;
+    }
+  </style>
+</head>
+<body>
+  <main class="phone">
+    <section class="hero">
+      <div class="topline">
+        <div class="avatar"></div>
+        <div class="name">
+          <strong>克的小屋</strong>
+          <span>Dylan Home · Mobile</span>
+        </div>
+      </div>
+
+      <h1>欢迎回来。</h1>
+      <p class="subtitle">
+        这里是手机入口。可以进门厅、写日记，也可以去管理页看运行状态。
+      </p>
+    </section>
+
+    <section class="actions">
+      <a class="btn" href="/dashboard">
+        <div class="left">
+          <div class="icon">🏠</div>
+          <div class="label">
+            <strong>进入小屋门厅</strong>
+            <span>查看日记本、通信状态、今日小白板和预留房间。</span>
+          </div>
+        </div>
+        <div class="arrow">›</div>
+      </a>
+
+      <a class="btn" href="/diary">
+        <div class="left">
+          <div class="icon">📖</div>
+          <div class="label">
+            <strong>打开双人日记本</strong>
+            <span>躺着也可以写今天这页。</span>
+          </div>
+        </div>
+        <div class="arrow">›</div>
+      </a>
+
+      <a class="btn" href="/admin">
+        <div class="left">
+          <div class="icon">⚙️</div>
+          <div class="label">
+            <strong>运行时管理</strong>
+            <span>需要登录。不会在这里显示密钥。</span>
+          </div>
+        </div>
+        <div class="arrow">›</div>
+      </a>
+    </section>
+
+    <p class="note">
+      仅本机 / 局域网可访问。Dylan 是家，不是公开展厅。
+    </p>
+  </main>
+</body>
+</html>`;
+
+  reply.type("text/html").send(html);
+});
+
+
+// ========================
+// Dashboard：克的小屋门厅
+// ========================
+app.get("/dashboard", async (req, reply) => {
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>克的小屋 · Dylan Dashboard</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Serif SC", "Noto Sans SC", sans-serif;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(255, 221, 231, 0.65), transparent 35%),
+        radial-gradient(circle at 80% 10%, rgba(230, 213, 255, 0.45), transparent 30%),
+        linear-gradient(135deg, #fff7fa 0%, #f7edf2 55%, #f4e8ee 100%);
+      color: #5b4048;
+      padding: 28px 18px;
+    }
+
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    header {
+      margin-bottom: 26px;
+      padding: 28px 26px;
+      border-radius: 28px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid rgba(210, 160, 176, 0.22);
+      box-shadow: 0 18px 50px rgba(160, 100, 120, 0.12);
+      backdrop-filter: blur(18px);
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: #a87886;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(32px, 6vw, 54px);
+      line-height: 1.05;
+      color: #8a4a58;
+      letter-spacing: 0.04em;
+    }
+
+    .subtitle {
+      margin: 14px 0 0;
+      font-size: 15px;
+      line-height: 1.8;
+      color: #7a5d65;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+
+    .card {
+      min-height: 176px;
+      padding: 22px;
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.68);
+      border: 1px solid rgba(210, 160, 176, 0.2);
+      box-shadow: 0 14px 38px rgba(160, 100, 120, 0.10);
+      backdrop-filter: blur(14px);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
+    }
+
+    .card.live:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 20px 50px rgba(160, 100, 120, 0.16);
+      border-color: rgba(180, 110, 130, 0.34);
+    }
+
+    .icon {
+      font-size: 28px;
+      margin-bottom: 12px;
+    }
+
+    h2 {
+      margin: 0 0 8px;
+      font-size: 20px;
+      color: #774652;
+    }
+
+    p {
+      margin: 0;
+      color: #7b6269;
+      line-height: 1.7;
+      font-size: 14px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      margin-top: 18px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      background: rgba(242, 220, 227, 0.8);
+      color: #8a4a58;
+    }
+
+    .mini-status {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 18px;
+      background: rgba(255, 248, 250, 0.75);
+      border: 1px solid rgba(214, 170, 184, 0.24);
+      color: #7d5661;
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    .mini-status strong {
+      color: #8a4a58;
+      font-weight: 700;
+    }
+
+    a.card {
+      text-decoration: none;
+      color: inherit;
+    }
+
+    .disabled {
+      opacity: 0.68;
+    }
+
+    .disabled .tag {
+      background: rgba(230, 224, 228, 0.75);
+      color: #9a8a90;
+    }
+
+    footer {
+      margin-top: 22px;
+      text-align: center;
+      color: #a1868f;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <p class="eyebrow">Dylan Home Dashboard · v0.1.7</p>
+      <h1>克的小屋</h1>
+      <p class="subtitle">
+        这里是 Dylan 的门厅。日记本已经是第一间能住的房间；其他房间先挂上门牌，之后慢慢接进来。
+      </p>
+    </header>
+
+    <section class="grid">
+      <a class="card live" href="/diary">
+        <div>
+          <div class="icon">📖</div>
+          <h2>日记本</h2>
+          <p>写下我们今天怎么走过来。然然和克各写一栏，留下每天的关系锚点。</p>
+          <div id="diaryStatusLine" class="mini-status">正在翻看今天的本子……</div>
+        </div>
+        <span class="tag">进入日记本 →</span>
+      </a>
+
+      <article class="card disabled">
+        <div>
+          <div class="icon">💌</div>
+          <h2>门口纸条</h2>
+          <p>短留言。醒来以后可以看见的话，也可以放暂时不想打扰对方的小纸条。</p>
+        </div>
+        <span class="tag">即将开放</span>
+      </article>
+
+      <article class="card disabled">
+        <div>
+          <div class="icon">🕯️</div>
+          <h2>通信状态</h2>
+          <p>看通不通。以后显示 Gateway、最近失败、最近一次克成功回复时间。</p>
+        </div>
+        <span class="tag">即将开放</span>
+      </article>
+
+      <article class="card disabled">
+        <div>
+          <div class="icon">🎐</div>
+          <h2>状态感知</h2>
+          <p>克在不在、累不累、低不低扰。以后接入轻量 Dylan 状态。</p>
+        </div>
+        <span class="tag">预留房间</span>
+      </article>
+
+      <article class="card disabled">
+        <div>
+          <div class="icon">🪶</div>
+          <h2>克的书桌</h2>
+          <p>以后放他的工具：写日记、留纸条、看状态、整理关系锚点。</p>
+        </div>
+        <span class="tag">工具箱预留位</span>
+      </article>
+
+      <article class="card disabled">
+        <div>
+          <div class="icon">🔖</div>
+          <h2>今日小白板</h2>
+          <p>今天的提醒和状态。比如日记已写、夜间低扰、水管半死、不要抽卡。</p>
+        </div>
+        <span class="tag">等待点灯</span>
+      </article>
+    </section>
+
+    <footer>
+      Pulse 是身体。Dylan 是家。现在先把灯打开。
+    </footer>
+  </main>
+  <script>
+    async function loadDiaryStatus() {
+      const box = document.getElementById("diaryStatusLine");
+      if (!box) return;
+
+      try {
+        const resp = await fetch("/api/dashboard/diary-status");
+        const data = await resp.json();
+
+        const ranran = data.ranran_written ? "已写" : "未写";
+        const ke = data.ke_written ? "已写" : "未写";
+        const pageLocked = data.page_locked ? "已封存" : "未封存";
+        const latest = data.latest_date || "还没有";
+        const total = data.total_pages || 0;
+
+        box.innerHTML =
+          "<strong>然然：</strong>" + ranran + " · <strong>克：</strong>" + ke +
+          "<br><strong>本页：</strong>" + pageLocked +
+          "<br><strong>最近一篇：</strong>" + latest +
+          "<br><strong>累计页数：</strong>" + total;
+      } catch (err) {
+        box.textContent = "日记状态读取失败。";
+      }
+    }
+
+    loadDiaryStatus();
+  </script>
+</body>
+</html>`;
+
+  reply.type("text/html").send(html);
+});
+
+app.get("/diary", async (req, reply) => {
+  try {
+    const html = fs.readFileSync("./public/diary.html", "utf-8");
+    reply.type("text/html").send(html);
+  } catch (err) {
+    reply.code(500).send("diary.html not found");
+  }
+});
+
+app.get("/api/diary", async (req, reply) => {
+  try {
+    const page = readDiaryPage(req.query.date);
+    reply.send(page);
+  } catch (err) {
+    reply.code(err.statusCode || 500).send({ error: err.message });
+  }
+});
+
+app.post("/api/diary", async (req, reply) => {
+  try {
+    const page = writeDiaryPage(req.body || {});
+    reply.send({ success: true, page });
+  } catch (err) {
+    reply.code(err.statusCode || 500).send({ success: false, error: err.message });
+  }
+});
+
+function hasDiaryContent(page) {
+  return Boolean(
+    (page.ranran_entry || "").trim() ||
+    (page.ke_entry || "").trim() ||
+    (page.anchor || "").trim() ||
+    (page.ranran_cover_note || "").trim() ||
+    (page.ke_cover_note || "").trim()
+  );
+}
+
+app.get("/api/diary/list", async (req, reply) => {
+  try {
+    ensureDiaryDir();
+
+    const dates = fs.readdirSync(DIARY_DIR)
+      .filter(name => DIARY_DATE_RE.test(name.replace(/\.json$/, "")))
+      .map(name => name.replace(/\.json$/, ""))
+      .filter(date => {
+        try {
+          const page = JSON.parse(fs.readFileSync(getDiaryPath(date), "utf-8"));
+          return hasDiaryContent(page);
+        } catch (err) {
+          return false;
+        }
+      })
+      .sort()
+      .reverse();
+
+    reply.send({ dates });
+  } catch (err) {
+    reply.code(500).send({ error: err.message });
+  }
+});
+
+app.get("/api/dashboard/diary-status", async (req, reply) => {
+  try {
+    ensureDiaryDir();
+
+    const today = getLocalDateString();
+    const todayPage = readDiaryPage(today);
+
+    const ranranWritten = Boolean(
+      (todayPage.ranran_entry || "").trim() ||
+      (todayPage.ranran_cover_note || "").trim()
+    );
+
+    const keWritten = Boolean(
+      (todayPage.ke_entry || "").trim() ||
+      (todayPage.ke_cover_note || "").trim()
+    );
+
+    const anchorWritten = Boolean((todayPage.anchor || "").trim());
+    const todayWritten = hasDiaryContent(todayPage);
+
+    const dates = fs.readdirSync(DIARY_DIR)
+      .filter(name => DIARY_DATE_RE.test(name.replace(/\.json$/, "")))
+      .map(name => name.replace(/\.json$/, ""))
+      .filter(date => {
+        try {
+          const page = JSON.parse(fs.readFileSync(getDiaryPath(date), "utf-8"));
+          return hasDiaryContent(page);
+        } catch (err) {
+          return false;
+        }
+      })
+      .sort()
+      .reverse();
+
+    reply.send({
+      today,
+      today_written: todayWritten,
+      ranran_written: ranranWritten,
+      ke_written: keWritten,
+      anchor_written: anchorWritten,
+      page_locked: !!todayPage.page_locked,
+      latest_date: dates[0] || null,
+      total_pages: dates.length
+    });
+  } catch (err) {
+    reply.code(500).send({ error: err.message });
+  }
+});
+
 
 // ========================
 // 启动服务
